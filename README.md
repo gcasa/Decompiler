@@ -66,9 +66,9 @@ The metadata line shows the detected file format, architecture, entry point, and
 
 ## Pseudocode Modes
 
-`Structured C` renders a function-like body with C-style assignments, calls, comparisons, branches, and returns where recognizable.
+`Structured C` runs a lightweight symbolic pass over the decoded instructions. It tracks register expressions, maps ABI argument registers to `arg0` through `arg3`, renders memory operands as pointer dereferences, derives comparison-based branch conditions, and emits C-like temporaries instead of wrapping assembly text.
 
-`Compact C` emits the same kind of lowering with less address commentary.
+`Compact C` emits the same symbolic C-like logic with less address commentary.
 
 `Verbose IR` emits a linear intermediate representation with instruction addresses, mnemonics, operands, and bytes.
 
@@ -76,9 +76,9 @@ The metadata line shows the detected file format, architecture, entry point, and
 
 ## Current Limitations
 
-This is a heuristic decompiler, not a full SSA/control-flow recovery system. It does not currently perform type recovery, stack variable reconstruction, register liveness analysis, function boundary discovery, symbol recovery, structured loop reconstruction, or cross-reference analysis.
+This is a heuristic decompiler, not a full SSA/control-flow recovery system. It does not currently perform full type recovery, stack variable reconstruction, global liveness analysis, function boundary discovery, symbol recovery, structured loop reconstruction, or cross-reference analysis.
 
-Unknown or unsupported instructions are preserved as inline `asm(...)` pseudocode so information is not silently discarded.
+Unknown or unsupported instructions are represented as named semantic effect helpers such as `state = op_name_effect(state, ...)` so information is not silently discarded without falling back to inline assembly blocks.
 
 Container parsing focuses on finding executable bytes and a reasonable entry/code section. For heavily packed, obfuscated, stripped, malformed, or unusual binaries, the output may require manual interpretation.
 

@@ -536,26 +536,11 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
 }
 
 - (NSString *)renderStructuredC:(NSArray<DCInstruction *> *)instructions name:(NSString *)name {
-    NSMutableString *out = [NSMutableString stringWithFormat:@"// Decompiled pseudocode for %@\nint function_entry(void) {\n", name];
-    for (DCInstruction *i in instructions) {
-        NSString *line = [self cLineForInstruction:i compact:NO];
-        [out appendFormat:@"    %@\n", line];
-        if ([self isReturnInstruction:i]) {
-            [out appendString:@"}\n"];
-            return out;
-        }
-    }
-    [out appendString:@"    return 0;\n}\n"];
-    return out;
+    return [self renderLogicalC:instructions name:name compact:NO];
 }
 
 - (NSString *)renderCompactC:(NSArray<DCInstruction *> *)instructions name:(NSString *)name {
-    NSMutableString *out = [NSMutableString stringWithFormat:@"int function_entry(void) { // %@\n", name];
-    for (DCInstruction *i in instructions) {
-        [out appendFormat:@"    %@\n", [self cLineForInstruction:i compact:YES]];
-    }
-    [out appendString:@"}\n"];
-    return out;
+    return [self renderLogicalC:instructions name:name compact:YES];
 }
 
 - (NSString *)renderVerboseIR:(NSArray<DCInstruction *> *)instructions name:(NSString *)name {
@@ -584,29 +569,493 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
     return out;
 }
 
+- (NSString *)renderLogicalC:(NSArray<DCInstruction *> *)instructions name:(NSString *)name compact:(BOOL)compact {
+    NSMutableString *out = [NSMutableString stringWithFormat:@"%@int function_entry(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {\n",
+                            compact ? @"" : [NSString stringWithFormat:@"// Decompiled logic for %@\n", name]];
+    NSMutableDictionary<NSString *, NSString *> *state = [NSMutableDictionary dictionary];
+    [self seedInitialRegisterState:state];
+    NSMutableSet<NSString *> *declared = [NSMutableSet setWithArray:@[@"arg0", @"arg1", @"arg2", @"arg3", @"result"]];
+    __block NSString *lastComparison = nil;
+    __block BOOL emittedAnyLogic = NO;
+
+    [instructions enumerateObjectsUsingBlock:^(DCInstruction *instruction, NSUInteger idx, BOOL *stop) {
+        NSString *line = [self logicalLineForInstruction:instruction
+                                                   state:state
+                                                declared:declared
+                                          lastComparison:&lastComparison
+                                                 compact:compact];
+        if (line.length > 0) {
+            emittedAnyLogic = YES;
+            [out appendFormat:@"    %@\n", line];
+        }
+        if ([self isReturnInstruction:instruction]) {
+            NSString *resultExpr = [self expressionForRegisterResultFromState:state];
+            if (resultExpr.length > 0 && ![resultExpr isEqualToString:@"result"]) {
+                [out appendFormat:@"    return %@;\n", resultExpr];
+            } else {
+                [out appendString:@"    return result;\n"];
+            }
+            [out appendString:@"}\n"];
+            *stop = YES;
+        }
+    }];
+
+    if (![out hasSuffix:@"}\n"]) {
+        if (!emittedAnyLogic) {
+            [out appendString:@"    /* No high-level side effects were recovered from the decoded entry block. */\n"];
+        }
+        NSString *resultExpr = [self expressionForRegisterResultFromState:state];
+        [out appendFormat:@"    return %@;\n}\n", resultExpr.length ? resultExpr : @"result"];
+    }
+    return out;
+}
+
+- (NSString *)logicalLineForInstruction:(DCInstruction *)instruction
+                                  state:(NSMutableDictionary<NSString *, NSString *> *)state
+                               declared:(NSMutableSet<NSString *> *)declared
+                         lastComparison:(NSString **)lastComparison
+                                compact:(BOOL)compact {
+    NSString *mn = instruction.mnemonic.lowercaseString;
+    NSArray<NSString *> *ops = [self operandsFromString:instruction.operands];
+    NSString *comment = compact ? @"" : [NSString stringWithFormat:@" // 0x%llx", instruction.address];
+
+    if ([mn isEqualToString:@"nop"] || [self isFrameSetupInstruction:instruction operands:ops]) {
+        return @"";
+    }
+    if ([self isReturnInstruction:instruction]) {
+        return @"";
+    }
+
+    if (([mn isEqualToString:@"mov"] || [mn isEqualToString:@"movz"] || [mn isEqualToString:@"movn"] ||
+         [mn isEqualToString:@"movsx"] || [mn isEqualToString:@"movsxd"] || [mn isEqualToString:@"movzx"] ||
+         [mn isEqualToString:@"adr"] || [mn isEqualToString:@"adrp"] || [mn isEqualToString:@"lea"]) && ops.count >= 2) {
+        NSString *dest = ops[0];
+        NSString *expr = [self logicalExpressionForOperand:ops[1] state:state];
+        return [self assignLogicalExpression:expr toOperand:dest state:state declared:declared comment:comment];
+    }
+
+    if (([mn hasPrefix:@"ldr"] || [mn isEqualToString:@"load"]) && ops.count >= 2) {
+        NSString *expr = [self logicalMemoryExpressionForOperand:ops[1] state:state];
+        return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if (([mn hasPrefix:@"str"] || [mn isEqualToString:@"store"]) && ops.count >= 2) {
+        NSString *value = [self logicalExpressionForOperand:ops[0] state:state];
+        NSString *target = [self logicalMemoryExpressionForOperand:ops[1] state:state];
+        return [NSString stringWithFormat:@"%@ = %@;%@", target, value, comment];
+    }
+
+    if ([mn isEqualToString:@"ldp"] && ops.count >= 3) {
+        NSString *base = [self logicalMemoryExpressionForOperand:ops[2] state:state];
+        [self assignLogicalExpression:[NSString stringWithFormat:@"%@.first", base] toOperand:ops[0] state:state declared:declared comment:@""];
+        [self assignLogicalExpression:[NSString stringWithFormat:@"%@.second", base] toOperand:ops[1] state:state declared:declared comment:@""];
+        return [NSString stringWithFormat:@"/* recovered pair load from %@ */%@", base, comment];
+    }
+
+    if ([mn isEqualToString:@"stp"] && ops.count >= 3) {
+        NSString *target = [self logicalMemoryExpressionForOperand:ops[2] state:state];
+        NSString *first = [self logicalExpressionForOperand:ops[0] state:state];
+        NSString *second = [self logicalExpressionForOperand:ops[1] state:state];
+        return [NSString stringWithFormat:@"store_pair(%@, %@, %@);%@", target, first, second, comment];
+    }
+
+    NSDictionary<NSString *, NSString *> *binary = @{
+        @"add": @"+", @"adds": @"+", @"adc": @"+", @"sub": @"-", @"subs": @"-", @"sbb": @"-",
+        @"imul": @"*", @"mul": @"*", @"and": @"&", @"ands": @"&", @"bic": @"& ~", @"orr": @"|", @"or": @"|",
+        @"eor": @"^", @"xor": @"^", @"shl": @"<<", @"sal": @"<<", @"shr": @">>", @"sar": @">>", @"lsl": @"<<", @"lsr": @">>", @"asr": @">>"
+    };
+    NSString *op = binary[mn];
+    if (op && ops.count >= 2) {
+        NSString *dest = ops[0];
+        NSString *lhs = [self logicalExpressionForOperand:(ops.count >= 3 ? ops[1] : ops[0]) state:state];
+        NSString *rhs = [self logicalExpressionForOperand:(ops.count >= 3 ? ops[2] : ops[1]) state:state];
+        NSString *expr = [NSString stringWithFormat:@"(%@ %@ %@)", lhs, op, rhs];
+        if ([mn hasSuffix:@"s"]) {
+            *lastComparison = [NSString stringWithFormat:@"compare(%@, 0)", expr];
+        }
+        return [self assignLogicalExpression:expr toOperand:dest state:state declared:declared comment:comment];
+    }
+
+    if ([mn isEqualToString:@"madd"] && ops.count >= 4) {
+        NSString *expr = [NSString stringWithFormat:@"((%@ * %@) + %@)",
+                          [self logicalExpressionForOperand:ops[1] state:state],
+                          [self logicalExpressionForOperand:ops[2] state:state],
+                          [self logicalExpressionForOperand:ops[3] state:state]];
+        return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if (([mn isEqualToString:@"udiv"] || [mn isEqualToString:@"sdiv"]) && ops.count >= 3) {
+        NSString *expr = [NSString stringWithFormat:@"(%@ / %@)",
+                          [self logicalExpressionForOperand:ops[1] state:state],
+                          [self logicalExpressionForOperand:ops[2] state:state]];
+        return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if (([mn isEqualToString:@"inc"] || [mn isEqualToString:@"dec"]) && ops.count >= 1) {
+        NSString *old = [self logicalExpressionForOperand:ops[0] state:state];
+        NSString *expr = [NSString stringWithFormat:@"(%@ %@ 1)", old, [mn isEqualToString:@"inc"] ? @"+" : @"-"];
+        *lastComparison = [NSString stringWithFormat:@"compare(%@, 0)", expr];
+        return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if (([mn isEqualToString:@"neg"] || [mn isEqualToString:@"not"]) && ops.count >= 1) {
+        NSString *expr = [NSString stringWithFormat:@"%@%@", [mn isEqualToString:@"neg"] ? @"-" : @"~", [self logicalExpressionForOperand:ops[0] state:state]];
+        return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if (([mn isEqualToString:@"cmp"] || [mn isEqualToString:@"test"] || [mn isEqualToString:@"tst"]) && ops.count >= 2) {
+        NSString *lhs = [self logicalExpressionForOperand:ops[0] state:state];
+        NSString *rhs = [self logicalExpressionForOperand:ops[1] state:state];
+        *lastComparison = [NSString stringWithFormat:@"compare(%@, %@)", lhs, rhs];
+        return @"";
+    }
+
+    if ([mn hasPrefix:@"cmov"] && ops.count >= 2) {
+        NSString *condition = [self logicalConditionForCode:[mn substringFromIndex:4] comparison:*lastComparison];
+        NSString *expr = [NSString stringWithFormat:@"(%@ ? %@ : %@)", condition, [self logicalExpressionForOperand:ops[1] state:state], [self logicalExpressionForOperand:ops[0] state:state]];
+        return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if ([mn hasPrefix:@"set"] && ops.count >= 1) {
+        NSString *condition = [self logicalConditionForCode:[mn substringFromIndex:3] comparison:*lastComparison];
+        return [self assignLogicalExpression:[NSString stringWithFormat:@"(%@ ? 1 : 0)", condition] toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if ([mn hasPrefix:@"cset"] && ops.count >= 1) {
+        NSString *condition = ops.count >= 2 ? [NSString stringWithFormat:@"condition_%@", [self sanitizedIdentifierFromString:ops[1] prefix:@""]] : @"condition";
+        return [self assignLogicalExpression:[NSString stringWithFormat:@"(%@ ? 1 : 0)", condition] toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if ([mn isEqualToString:@"call"] || [mn isEqualToString:@"bl"] || [mn isEqualToString:@"blr"]) {
+        NSString *target = instruction.operands.length ? instruction.operands : @"indirect";
+        NSString *line = [NSString stringWithFormat:@"result = %@(%@, %@, %@, %@);%@",
+                          [self sanitizedCallTarget:target],
+                          [self callArgumentExpressionAtIndex:0 state:state],
+                          [self callArgumentExpressionAtIndex:1 state:state],
+                          [self callArgumentExpressionAtIndex:2 state:state],
+                          [self callArgumentExpressionAtIndex:3 state:state],
+                          comment];
+        state[@"x0"] = @"result";
+        state[@"w0"] = @"result";
+        state[@"rax"] = @"result";
+        state[@"eax"] = @"result";
+        return line;
+    }
+
+    if ([mn isEqualToString:@"svc"] || [mn isEqualToString:@"syscall"] || [mn isEqualToString:@"int"]) {
+        return [NSString stringWithFormat:@"result = system_call(arg0, arg1, arg2, arg3);%@", comment];
+    }
+
+    if ([self isConditionalJump:mn]) {
+        NSString *condition = [self logicalConditionForJumpInstruction:instruction operands:ops state:state comparison:*lastComparison];
+        return [NSString stringWithFormat:@"if (%@) goto %@;%@", condition, [self sanitizedTarget:ops.lastObject ?: instruction.operands], comment];
+    }
+
+    if ([mn isEqualToString:@"jmp"] || [mn isEqualToString:@"b"]) {
+        return [NSString stringWithFormat:@"goto %@;%@", [self sanitizedTarget:instruction.operands], comment];
+    }
+
+    if ([mn isEqualToString:@"push"] || [mn isEqualToString:@"pop"] || [mn isEqualToString:@"leave"]) {
+        return @"";
+    }
+
+    return [NSString stringWithFormat:@"%@;%@", [self semanticFallbackForInstruction:instruction operands:ops], comment];
+}
+
+- (BOOL)isFrameSetupInstruction:(DCInstruction *)instruction operands:(NSArray<NSString *> *)ops {
+    NSString *mn = instruction.mnemonic.lowercaseString;
+    if ([mn isEqualToString:@"push"] && ops.count == 1) {
+        NSString *op = ops[0].lowercaseString;
+        return [op isEqualToString:@"rbp"] || [op isEqualToString:@"ebp"] || [op isEqualToString:@"fp"] || [op isEqualToString:@"x29"];
+    }
+    if ([mn isEqualToString:@"mov"] && ops.count >= 2) {
+        NSString *dst = ops[0].lowercaseString;
+        NSString *src = ops[1].lowercaseString;
+        return (([dst isEqualToString:@"rbp"] || [dst isEqualToString:@"ebp"]) && ([src isEqualToString:@"rsp"] || [src isEqualToString:@"esp"]));
+    }
+    if (([mn isEqualToString:@"sub"] || [mn isEqualToString:@"add"]) && ops.count >= 2) {
+        NSString *dst = ops[0].lowercaseString;
+        return [dst isEqualToString:@"sp"] || [dst isEqualToString:@"rsp"] || [dst isEqualToString:@"esp"];
+    }
+    if ([mn isEqualToString:@"stp"] && ops.count >= 3) {
+        NSString *first = ops[0].lowercaseString;
+        NSString *second = ops[1].lowercaseString;
+        NSString *where = ops[2].lowercaseString;
+        return ([first isEqualToString:@"x29"] && [second isEqualToString:@"x30"] && [where containsString:@"sp"]);
+    }
+    if ([mn isEqualToString:@"mov"] && ops.count >= 2) {
+        return [ops[0].lowercaseString isEqualToString:@"x29"] && [ops[1].lowercaseString isEqualToString:@"sp"];
+    }
+    return NO;
+}
+
+- (NSString *)assignLogicalExpression:(NSString *)expr
+                             toOperand:(NSString *)operand
+                                 state:(NSMutableDictionary<NSString *, NSString *> *)state
+                              declared:(NSMutableSet<NSString *> *)declared
+                               comment:(NSString *)comment {
+    NSString *trimmed = [operand stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([self isRegisterOperand:trimmed]) {
+        NSString *reg = [self canonicalRegister:trimmed];
+        NSString *name = [self variableNameForRegister:reg];
+        if ([self shouldSuppressTemporaryRegister:reg expression:expr]) {
+            state[reg] = expr;
+            return @"";
+        }
+        state[reg] = name;
+        NSString *prefix = [declared containsObject:name] ? @"" : @"uint64_t ";
+        [declared addObject:name];
+        return [NSString stringWithFormat:@"%@%@ = %@;%@", prefix, name, expr, comment];
+    }
+
+    NSString *target = [self logicalMemoryExpressionForOperand:trimmed state:state];
+    return [NSString stringWithFormat:@"%@ = %@;%@", target, expr, comment];
+}
+
+- (BOOL)shouldSuppressTemporaryRegister:(NSString *)reg expression:(NSString *)expr {
+    if ([reg hasPrefix:@"sp"] || [reg hasPrefix:@"rsp"] || [reg hasPrefix:@"esp"] ||
+        [reg hasPrefix:@"fp"] || [reg hasPrefix:@"rbp"] || [reg hasPrefix:@"ebp"] ||
+        [reg isEqualToString:@"x29"] || [reg isEqualToString:@"x30"] || [reg isEqualToString:@"lr"]) {
+        return YES;
+    }
+    return NO;
+}
+
+- (NSString *)logicalExpressionForOperand:(NSString *)operand state:(NSDictionary<NSString *, NSString *> *)state {
+    NSString *trimmed = [operand stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (trimmed.length == 0) {
+        return @"unknown";
+    }
+    if ([self isRegisterOperand:trimmed]) {
+        NSString *reg = [self canonicalRegister:trimmed];
+        return state[reg] ?: [self variableNameForRegister:reg];
+    }
+    if ([trimmed hasPrefix:@"#"]) {
+        return [trimmed substringFromIndex:1];
+    }
+    if ([trimmed hasPrefix:@"["] || [trimmed containsString:@" ptr "]) {
+        return [self logicalMemoryExpressionForOperand:trimmed state:state];
+    }
+    return [self sanitizedLiteralExpression:trimmed];
+}
+
+- (NSString *)logicalMemoryExpressionForOperand:(NSString *)operand state:(NSDictionary<NSString *, NSString *> *)state {
+    NSString *trimmed = [operand stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *inner = trimmed;
+    NSRange bracketStart = [inner rangeOfString:@"["];
+    NSRange bracketEnd = [inner rangeOfString:@"]" options:NSBackwardsSearch];
+    if (bracketStart.location != NSNotFound && bracketEnd.location != NSNotFound && bracketEnd.location > bracketStart.location) {
+        inner = [inner substringWithRange:NSMakeRange(bracketStart.location + 1, bracketEnd.location - bracketStart.location - 1)];
+    }
+    inner = [inner stringByReplacingOccurrencesOfString:@"#" withString:@""];
+    inner = [inner stringByReplacingOccurrencesOfString:@"," withString:@" +"];
+    NSArray<NSString *> *tokens = [inner componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *token in tokens) {
+        NSString *part = [token stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (part.length == 0 || [part isEqualToString:@"+"]) continue;
+        if ([self isRegisterOperand:part]) {
+            [parts addObject:[self logicalExpressionForOperand:part state:state]];
+        } else {
+            [parts addObject:[self sanitizedLiteralExpression:part]];
+        }
+    }
+    NSString *address = parts.count ? [parts componentsJoinedByString:@" + "] : [self sanitizedLiteralExpression:trimmed];
+    return [NSString stringWithFormat:@"*((uint64_t *)(%@))", address];
+}
+
+- (NSString *)expressionForRegisterResultFromState:(NSDictionary<NSString *, NSString *> *)state {
+    for (NSString *reg in @[@"x0", @"w0", @"rax", @"eax", @"r0"]) {
+        NSString *expr = state[reg];
+        if (expr.length > 0) return expr;
+    }
+    return @"result";
+}
+
+- (NSString *)callArgumentExpressionAtIndex:(NSUInteger)index state:(NSDictionary<NSString *, NSString *> *)state {
+    NSArray<NSArray<NSString *> *> *sets = @[
+        @[@"x0", @"w0", @"rdi", @"edi", @"r0"],
+        @[@"x1", @"w1", @"rsi", @"esi", @"r1"],
+        @[@"x2", @"w2", @"rdx", @"edx", @"r2"],
+        @[@"x3", @"w3", @"rcx", @"ecx", @"r3"],
+    ];
+    if (index >= sets.count) return [NSString stringWithFormat:@"arg%lu", (unsigned long)index];
+    for (NSString *reg in sets[index]) {
+        NSString *expr = state[reg];
+        if (expr.length > 0) return expr;
+    }
+    return [NSString stringWithFormat:@"arg%lu", (unsigned long)index];
+}
+
+- (NSString *)logicalConditionForJumpInstruction:(DCInstruction *)instruction
+                                       operands:(NSArray<NSString *> *)ops
+                                          state:(NSDictionary<NSString *, NSString *> *)state
+                                     comparison:(NSString *)comparison {
+    NSString *mn = instruction.mnemonic.lowercaseString;
+    mn = [mn stringByReplacingOccurrencesOfString:@"." withString:@""];
+    if (([mn isEqualToString:@"cbz"] || [mn isEqualToString:@"cbnz"]) && ops.count >= 2) {
+        NSString *expr = [self logicalExpressionForOperand:ops[0] state:state];
+        return [NSString stringWithFormat:@"%@ %@ 0", expr, [mn isEqualToString:@"cbz"] ? @"==" : @"!="];
+    }
+    if (([mn isEqualToString:@"tbz"] || [mn isEqualToString:@"tbnz"]) && ops.count >= 3) {
+        NSString *expr = [self logicalExpressionForOperand:ops[0] state:state];
+        NSString *bit = [self logicalExpressionForOperand:ops[1] state:state];
+        return [NSString stringWithFormat:@"((%@ & (1ULL << %@)) %@ 0)", expr, bit, [mn isEqualToString:@"tbz"] ? @"==" : @"!="];
+    }
+    NSString *code = mn;
+    if ([code hasPrefix:@"j"]) code = [code substringFromIndex:1];
+    if ([code hasPrefix:@"b"] && code.length > 1) code = [code substringFromIndex:1];
+    return [self logicalConditionForCode:code comparison:comparison];
+}
+
+- (NSString *)logicalConditionForCode:(NSString *)code comparison:(NSString *)comparison {
+    NSString *cmp = comparison.length ? comparison : @"compare(lhs, rhs)";
+    NSDictionary<NSString *, NSString *> *conditions = @{
+        @"e": @"%@ == 0", @"z": @"%@ == 0", @"eq": @"%@ == 0",
+        @"ne": @"%@ != 0", @"nz": @"%@ != 0",
+        @"g": @"%@ > 0", @"gt": @"%@ > 0",
+        @"ge": @"%@ >= 0",
+        @"l": @"%@ < 0", @"lt": @"%@ < 0",
+        @"le": @"%@ <= 0",
+        @"a": @"%@ > 0", @"hi": @"%@ > 0",
+        @"ae": @"%@ >= 0", @"hs": @"%@ >= 0",
+        @"b": @"%@ < 0", @"lo": @"%@ < 0",
+        @"be": @"%@ <= 0", @"ls": @"%@ <= 0",
+        @"o": @"overflow", @"no": @"!overflow",
+        @"s": @"sign", @"ns": @"!sign",
+    };
+    NSString *format = conditions[code.lowercaseString];
+    if (!format) {
+        return [NSString stringWithFormat:@"condition_%@(%@)", [self sanitizedIdentifierFromString:code prefix:@""], cmp];
+    }
+    if ([format containsString:@"%@"]) {
+        return [NSString stringWithFormat:format, cmp];
+    }
+    return format;
+}
+
+- (NSString *)sanitizedCallTarget:(NSString *)target {
+    NSString *trimmed = [target stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (trimmed.length == 0) return @"indirect_call";
+    if ([trimmed hasPrefix:@"#"]) trimmed = [trimmed substringFromIndex:1];
+    if ([trimmed hasPrefix:@"0x"]) return [NSString stringWithFormat:@"sub_%@", [self sanitizedIdentifierFromString:trimmed prefix:@""]];
+    return [self sanitizedIdentifierFromString:trimmed prefix:@"call_"];
+}
+
+- (NSString *)sanitizedLiteralExpression:(NSString *)value {
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    trimmed = [trimmed stringByReplacingOccurrencesOfString:@"#" withString:@""];
+    trimmed = [trimmed stringByReplacingOccurrencesOfString:@"$" withString:@""];
+    return trimmed.length ? trimmed : @"unknown";
+}
+
+- (BOOL)isRegisterOperand:(NSString *)operand {
+    NSString *reg = [self canonicalRegister:operand];
+    if (reg.length == 0) return NO;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^(x|w|r)[0-9]+$|^(rax|eax|rbx|ebx|rcx|ecx|rdx|edx|rsi|esi|rdi|edi|rsp|esp|rbp|ebp|sp|fp|lr|ip|pc|x29|x30)$"
+                                                                           options:0
+                                                                             error:nil];
+    return [regex firstMatchInString:reg options:0 range:NSMakeRange(0, reg.length)] != nil;
+}
+
+- (void)seedInitialRegisterState:(NSMutableDictionary<NSString *, NSString *> *)state {
+    NSDictionary<NSString *, NSString *> *initial = @{
+        @"x0": @"arg0", @"w0": @"arg0", @"r0": @"arg0", @"rdi": @"arg0", @"edi": @"arg0",
+        @"x1": @"arg1", @"w1": @"arg1", @"r1": @"arg1", @"rsi": @"arg1", @"esi": @"arg1",
+        @"x2": @"arg2", @"w2": @"arg2", @"r2": @"arg2", @"rdx": @"arg2", @"edx": @"arg2",
+        @"x3": @"arg3", @"w3": @"arg3", @"r3": @"arg3", @"rcx": @"arg3", @"ecx": @"arg3",
+    };
+    [state addEntriesFromDictionary:initial];
+}
+
+- (NSString *)canonicalRegister:(NSString *)operand {
+    NSString *reg = [[operand stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
+    reg = [reg stringByReplacingOccurrencesOfString:@"," withString:@""];
+    return reg;
+}
+
+- (NSString *)variableNameForRegister:(NSString *)reg {
+    NSDictionary<NSString *, NSString *> *names = @{
+        @"x0": @"tmp_x0", @"w0": @"tmp_w0", @"r0": @"tmp_r0", @"rdi": @"tmp_rdi", @"edi": @"tmp_edi",
+        @"x1": @"tmp_x1", @"w1": @"tmp_w1", @"r1": @"tmp_r1", @"rsi": @"tmp_rsi", @"esi": @"tmp_esi",
+        @"x2": @"tmp_x2", @"w2": @"tmp_w2", @"r2": @"tmp_r2", @"rdx": @"tmp_rdx", @"edx": @"tmp_edx",
+        @"x3": @"tmp_x3", @"w3": @"tmp_w3", @"r3": @"tmp_r3", @"rcx": @"tmp_rcx", @"ecx": @"tmp_ecx",
+        @"rax": @"result", @"eax": @"result",
+        @"sp": @"stack_pointer", @"rsp": @"stack_pointer", @"esp": @"stack_pointer",
+        @"fp": @"frame_pointer", @"rbp": @"frame_pointer", @"ebp": @"frame_pointer", @"x29": @"frame_pointer",
+        @"lr": @"return_address", @"x30": @"return_address",
+    };
+    NSString *name = names[reg];
+    if (name) return name;
+    return [self sanitizedIdentifierFromString:reg prefix:@"tmp_"];
+}
+
 - (NSString *)cLineForInstruction:(DCInstruction *)i compact:(BOOL)compact {
     NSString *mn = i.mnemonic.lowercaseString;
     NSArray<NSString *> *ops = [self operandsFromString:i.operands];
     NSString *comment = compact ? @"" : [NSString stringWithFormat:@" // 0x%llx: %@ %@", i.address, i.mnemonic, i.operands];
 
-    if (([mn isEqualToString:@"mov"] || [mn isEqualToString:@"movz"] || [mn isEqualToString:@"ldr"] || [mn isEqualToString:@"lea"]) && ops.count >= 2) {
+    if (([mn isEqualToString:@"mov"] || [mn isEqualToString:@"movz"] || [mn isEqualToString:@"movn"] ||
+         [mn isEqualToString:@"movsx"] || [mn isEqualToString:@"movsxd"] || [mn isEqualToString:@"movzx"] ||
+         [mn isEqualToString:@"adr"] || [mn isEqualToString:@"adrp"] || [mn isEqualToString:@"lea"]) && ops.count >= 2) {
         return [NSString stringWithFormat:@"%@ = %@;%@", ops[0], ops[1], comment];
     }
-    if (([mn isEqualToString:@"str"] || [mn isEqualToString:@"store"]) && ops.count >= 2) {
+    if (([mn hasPrefix:@"ldr"] || [mn isEqualToString:@"load"]) && ops.count >= 2) {
+        return [NSString stringWithFormat:@"%@ = load(%@);%@", ops[0], ops[1], comment];
+    }
+    if (([mn hasPrefix:@"str"] || [mn isEqualToString:@"store"]) && ops.count >= 2) {
         return [NSString stringWithFormat:@"%@ = %@;%@", ops[1], ops[0], comment];
     }
+    if (([mn isEqualToString:@"ldp"] || [mn isEqualToString:@"popa"]) && ops.count >= 3) {
+        return [NSString stringWithFormat:@"tie(%@, %@) = load_pair(%@);%@", ops[0], ops[1], ops[2], comment];
+    }
+    if (([mn isEqualToString:@"stp"] || [mn isEqualToString:@"pusha"]) && ops.count >= 3) {
+        return [NSString stringWithFormat:@"store_pair(%@, %@, %@);%@", ops[2], ops[0], ops[1], comment];
+    }
     NSDictionary<NSString *, NSString *> *binary = @{
-        @"add": @"+", @"sub": @"-", @"imul": @"*", @"mul": @"*", @"and": @"&", @"or": @"|", @"xor": @"^",
-        @"shl": @"<<", @"sal": @"<<", @"shr": @">>", @"sar": @">>", @"lsl": @"<<", @"lsr": @">>"
+        @"add": @"+", @"adds": @"+", @"adc": @"+ carry +", @"sub": @"-", @"subs": @"-", @"sbb": @"- borrow -",
+        @"imul": @"*", @"mul": @"*", @"and": @"&", @"ands": @"&", @"bic": @"& ~", @"orr": @"|", @"or": @"|",
+        @"eor": @"^", @"xor": @"^", @"shl": @"<<", @"sal": @"<<", @"shr": @">>", @"sar": @">>", @"lsl": @"<<", @"lsr": @">>", @"asr": @">>"
     };
     NSString *op = binary[mn];
     if (op && ops.count >= 2) {
         NSString *lhs = ops.count >= 3 ? ops[1] : ops[0];
         NSString *rhs = ops.count >= 3 ? ops[2] : ops[1];
-        return [NSString stringWithFormat:@"%@ = %@ %@ %@;%@", ops[0], lhs, op, rhs, comment];
+        NSString *line = [NSString stringWithFormat:@"%@ = %@ %@ %@;", ops[0], lhs, op, rhs];
+        if ([mn hasSuffix:@"s"] || [mn isEqualToString:@"cmp"] || [mn isEqualToString:@"test"]) {
+            line = [line stringByAppendingFormat:@" flags = update_flags(%@);", ops[0]];
+        }
+        return [line stringByAppendingString:comment];
+    }
+    if ([mn isEqualToString:@"madd"] && ops.count >= 4) {
+        return [NSString stringWithFormat:@"%@ = (%@ * %@) + %@;%@", ops[0], ops[1], ops[2], ops[3], comment];
+    }
+    if (([mn isEqualToString:@"udiv"] || [mn isEqualToString:@"sdiv"]) && ops.count >= 3) {
+        return [NSString stringWithFormat:@"%@ = %@ / %@;%@", ops[0], ops[1], ops[2], comment];
+    }
+    if (([mn isEqualToString:@"div"] || [mn isEqualToString:@"idiv"]) && ops.count >= 1) {
+        return [NSString stringWithFormat:@"tie(quotient, remainder) = divide(accumulator, %@);%@", ops[0], comment];
+    }
+    if (([mn isEqualToString:@"inc"] || [mn isEqualToString:@"dec"]) && ops.count >= 1) {
+        NSString *opText = [mn isEqualToString:@"inc"] ? @"+" : @"-";
+        return [NSString stringWithFormat:@"%@ = %@ %@ 1; flags = update_flags(%@);%@", ops[0], ops[0], opText, ops[0], comment];
+    }
+    if (([mn isEqualToString:@"neg"] || [mn isEqualToString:@"not"]) && ops.count >= 1) {
+        NSString *opText = [mn isEqualToString:@"neg"] ? @"-" : @"~";
+        return [NSString stringWithFormat:@"%@ = %@%@; flags = update_flags(%@);%@", ops[0], opText, ops[0], ops[0], comment];
     }
     if (([mn isEqualToString:@"cmp"] || [mn isEqualToString:@"test"] || [mn isEqualToString:@"tst"]) && ops.count >= 2) {
         return [NSString stringWithFormat:@"flags = compare(%@, %@);%@", ops[0], ops[1], comment];
+    }
+    if ([mn hasPrefix:@"cmov"] && ops.count >= 2) {
+        return [NSString stringWithFormat:@"if (%@) %@ = %@;%@", [self conditionForConditionalMove:mn], ops[0], ops[1], comment];
+    }
+    if ([mn hasPrefix:@"set"] && ops.count >= 1) {
+        return [NSString stringWithFormat:@"%@ = %@ ? 1 : 0;%@", ops[0], [self conditionForSet:mn], comment];
+    }
+    if ([mn hasPrefix:@"cset"] && ops.count >= 1) {
+        NSString *condition = ops.count >= 2 ? ops[1] : @"condition";
+        return [NSString stringWithFormat:@"%@ = condition_%@ ? 1 : 0;%@", ops[0], condition, comment];
     }
     if ([mn isEqualToString:@"push"] && ops.count >= 1) {
         return [NSString stringWithFormat:@"push(%@);%@", ops[0], comment];
@@ -614,8 +1063,17 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
     if ([mn isEqualToString:@"pop"] && ops.count >= 1) {
         return [NSString stringWithFormat:@"%@ = pop();%@", ops[0], comment];
     }
+    if ([mn isEqualToString:@"leave"]) {
+        return [NSString stringWithFormat:@"stack_frame = restore_caller_frame();%@", comment];
+    }
     if ([mn isEqualToString:@"call"] || [mn isEqualToString:@"bl"] || [mn isEqualToString:@"blr"]) {
         return [NSString stringWithFormat:@"call(%@);%@", i.operands.length ? i.operands : @"indirect", comment];
+    }
+    if ([mn isEqualToString:@"svc"] || [mn isEqualToString:@"syscall"] || [mn isEqualToString:@"int"]) {
+        return [NSString stringWithFormat:@"system_call(%@);%@", i.operands.length ? i.operands : @"current_registers", comment];
+    }
+    if ([mn isEqualToString:@"xchg"] && ops.count >= 2) {
+        return [NSString stringWithFormat:@"swap(%@, %@);%@", ops[0], ops[1], comment];
     }
     if ([self isConditionalJump:mn]) {
         return [NSString stringWithFormat:@"if (%@) goto %@;%@", [self conditionForJump:mn], [self sanitizedTarget:i.operands], comment];
@@ -632,7 +1090,7 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
     if ([mn isEqualToString:@"nop"]) {
         return [NSString stringWithFormat:@"/* nop */%@", comment];
     }
-    return [NSString stringWithFormat:@"asm(\"%@ %@\");%@", i.mnemonic, i.operands, comment];
+    return [NSString stringWithFormat:@"%@;%@", [self semanticFallbackForInstruction:i operands:ops], comment];
 }
 
 - (NSArray<NSString *> *)operandsFromString:(NSString *)operands {
@@ -669,7 +1127,7 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
 }
 
 - (BOOL)isConditionalJump:(NSString *)mnemonic {
-    NSString *m = mnemonic.lowercaseString;
+    NSString *m = [mnemonic.lowercaseString stringByReplacingOccurrencesOfString:@"." withString:@""];
     if ([m hasPrefix:@"j"] && ![m isEqualToString:@"jmp"]) return YES;
     return [@[@"cbz", @"cbnz", @"tbz", @"tbnz", @"beq", @"bne", @"bgt", @"bge", @"blt", @"ble", @"bhi", @"bls"] containsObject:m];
 }
@@ -684,7 +1142,47 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
         @"tbz": @"bit_is_zero", @"tbnz": @"bit_is_not_zero", @"beq": @"flags.equal", @"bne": @"!flags.equal",
         @"bgt": @"flags.greater", @"bge": @"flags.greater_or_equal", @"blt": @"flags.less", @"ble": @"flags.less_or_equal",
     };
-    return conditions[mnemonic.lowercaseString] ?: [NSString stringWithFormat:@"condition_%@", mnemonic];
+    NSString *key = [mnemonic.lowercaseString stringByReplacingOccurrencesOfString:@"." withString:@""];
+    return conditions[key] ?: [NSString stringWithFormat:@"condition_%@", key];
+}
+
+- (NSString *)conditionForConditionalMove:(NSString *)mnemonic {
+    NSString *suffix = [mnemonic.lowercaseString stringByReplacingOccurrencesOfString:@"cmov" withString:@""];
+    return [self conditionForConditionCode:suffix];
+}
+
+- (NSString *)conditionForSet:(NSString *)mnemonic {
+    NSString *suffix = [mnemonic.lowercaseString stringByReplacingOccurrencesOfString:@"set" withString:@""];
+    return [self conditionForConditionCode:suffix];
+}
+
+- (NSString *)conditionForConditionCode:(NSString *)code {
+    NSDictionary<NSString *, NSString *> *conditions = @{
+        @"e": @"flags.equal", @"z": @"flags.zero", @"ne": @"!flags.equal", @"nz": @"!flags.zero",
+        @"g": @"flags.greater", @"ge": @"flags.greater_or_equal", @"l": @"flags.less", @"le": @"flags.less_or_equal",
+        @"a": @"flags.above", @"ae": @"flags.above_or_equal", @"b": @"flags.below", @"be": @"flags.below_or_equal",
+        @"o": @"flags.overflow", @"no": @"!flags.overflow", @"s": @"flags.sign", @"ns": @"!flags.sign",
+        @"p": @"flags.parity", @"pe": @"flags.parity", @"np": @"!flags.parity", @"po": @"!flags.parity",
+    };
+    return conditions[code.lowercaseString] ?: [NSString stringWithFormat:@"condition_%@", code];
+}
+
+- (NSString *)semanticFallbackForInstruction:(DCInstruction *)instruction operands:(NSArray<NSString *> *)operands {
+    NSString *name = [self sanitizedIdentifierFromString:instruction.mnemonic.lowercaseString prefix:@"op_"];
+    if (operands.count == 0) {
+        return [NSString stringWithFormat:@"%@_effect(state)", name];
+    }
+    return [NSString stringWithFormat:@"state = %@_effect(state, %@)", name, [operands componentsJoinedByString:@", "]];
+}
+
+- (NSString *)sanitizedIdentifierFromString:(NSString *)value prefix:(NSString *)prefix {
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"];
+    NSMutableString *out = [NSMutableString stringWithString:prefix ?: @""];
+    for (NSUInteger i = 0; i < value.length; i++) {
+        unichar c = [value characterAtIndex:i];
+        [out appendFormat:@"%C", (unichar)([allowed characterIsMember:c] ? c : '_')];
+    }
+    return out;
 }
 
 - (NSString *)sanitizedTarget:(NSString *)target {

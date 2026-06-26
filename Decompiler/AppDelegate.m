@@ -259,7 +259,7 @@
         NSBackgroundColorAttributeName: background,
     }];
 
-    [self applyPattern:@"\\b(int|void|return|if|goto|asm|call|flags|compare)\\b"
+    [self applyPattern:@"\\b(int|void|return|if|goto|call|flags|compare|state|effect|load|push|pop|swap|system_call|update_flags)\\b"
                  color:[NSColor colorWithCalibratedRed:0.0 green:0.18 blue:0.58 alpha:1.0]
                     to:highlighted];
     [self applyPattern:@"\\b(0x[0-9a-fA-F]+|[0-9]+)\\b"
