@@ -32,6 +32,20 @@ typedef struct {
 @implementation DCInstruction
 @end
 
+@interface DCLogicalStatement : NSObject
+@property (nonatomic) uint64_t address;
+@property (nonatomic, copy) NSString *line;
+@property (nonatomic, copy) NSString *condition;
+@property (nonatomic, copy) NSString *targetLabel;
+@property (nonatomic) uint64_t targetAddress;
+@property (nonatomic) BOOL conditionalBranch;
+@property (nonatomic) BOOL unconditionalBranch;
+@property (nonatomic) BOOL returns;
+@end
+
+@implementation DCLogicalStatement
+@end
+
 @implementation DCDecompilerEngine
 
 + (NSArray<NSString *> *)pseudocodeStyleNames {
@@ -572,42 +586,259 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
 - (NSString *)renderLogicalC:(NSArray<DCInstruction *> *)instructions name:(NSString *)name compact:(BOOL)compact {
     NSMutableString *out = [NSMutableString stringWithFormat:@"%@int function_entry(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {\n",
                             compact ? @"" : [NSString stringWithFormat:@"// Decompiled logic for %@\n", name]];
+    NSArray<DCLogicalStatement *> *statements = [self logicalStatementsForInstructions:instructions compact:compact];
+    if (statements.count == 0) {
+        [out appendString:@"    /* No high-level side effects were recovered from the decoded entry block. */\n"];
+        [out appendString:@"    return result;\n}\n"];
+        return out;
+    }
+    NSMutableDictionary<NSNumber *, NSNumber *> *addressToIndex = [NSMutableDictionary dictionary];
+    for (NSUInteger i = 0; i < statements.count; i++) {
+        addressToIndex[@(statements[i].address)] = @(i);
+    }
+    [self appendStructuredStatements:statements
+                               from:0
+                                 to:statements.count
+                             indent:1
+                                 out:out
+                      addressToIndex:addressToIndex];
+    if (![out hasSuffix:@"}\n"]) {
+        [out appendString:@"}\n"];
+    }
+    return out;
+}
+
+- (NSArray<DCLogicalStatement *> *)logicalStatementsForInstructions:(NSArray<DCInstruction *> *)instructions compact:(BOOL)compact {
     NSMutableDictionary<NSString *, NSString *> *state = [NSMutableDictionary dictionary];
     [self seedInitialRegisterState:state];
     NSMutableSet<NSString *> *declared = [NSMutableSet setWithArray:@[@"arg0", @"arg1", @"arg2", @"arg3", @"result"]];
     __block NSString *lastComparison = nil;
-    __block BOOL emittedAnyLogic = NO;
+    NSMutableArray<DCLogicalStatement *> *statements = [NSMutableArray array];
 
     [instructions enumerateObjectsUsingBlock:^(DCInstruction *instruction, NSUInteger idx, BOOL *stop) {
+        DCLogicalStatement *statement = [DCLogicalStatement new];
+        statement.address = instruction.address;
+        NSString *mn = instruction.mnemonic.lowercaseString;
+        NSArray<NSString *> *ops = [self operandsFromString:instruction.operands];
+
+        if ([self isConditionalJump:mn]) {
+            statement.conditionalBranch = YES;
+            statement.condition = [self logicalConditionForJumpInstruction:instruction operands:ops state:state comparison:lastComparison];
+            statement.targetAddress = [self targetAddressFromOperand:ops.lastObject ?: instruction.operands];
+            statement.targetLabel = [self sanitizedTarget:ops.lastObject ?: instruction.operands];
+            [statements addObject:statement];
+            return;
+        }
+        if ([self isUnconditionalJump:mn]) {
+            statement.unconditionalBranch = YES;
+            statement.targetAddress = [self targetAddressFromOperand:instruction.operands];
+            statement.targetLabel = [self sanitizedTarget:instruction.operands];
+            [statements addObject:statement];
+            return;
+        }
+
         NSString *line = [self logicalLineForInstruction:instruction
                                                    state:state
                                                 declared:declared
                                           lastComparison:&lastComparison
                                                  compact:compact];
         if (line.length > 0) {
-            emittedAnyLogic = YES;
-            [out appendFormat:@"    %@\n", line];
+            statement.line = line;
+            [statements addObject:statement];
+        } else if (![self isReturnInstruction:instruction]) {
+            [statements addObject:statement];
         }
         if ([self isReturnInstruction:instruction]) {
+            DCLogicalStatement *returnStatement = [DCLogicalStatement new];
+            returnStatement.address = instruction.address;
+            returnStatement.returns = YES;
             NSString *resultExpr = [self expressionForRegisterResultFromState:state];
             if (resultExpr.length > 0 && ![resultExpr isEqualToString:@"result"]) {
-                [out appendFormat:@"    return %@;\n", resultExpr];
+                returnStatement.line = [NSString stringWithFormat:@"return %@;", resultExpr];
             } else {
-                [out appendString:@"    return result;\n"];
+                returnStatement.line = @"return result;";
             }
-            [out appendString:@"}\n"];
+            [statements addObject:returnStatement];
             *stop = YES;
         }
     }];
-
-    if (![out hasSuffix:@"}\n"]) {
-        if (!emittedAnyLogic) {
-            [out appendString:@"    /* No high-level side effects were recovered from the decoded entry block. */\n"];
-        }
+    if (statements.count == 0 || !statements.lastObject.returns) {
+        DCLogicalStatement *returnStatement = [DCLogicalStatement new];
+        returnStatement.address = instructions.lastObject.address;
+        returnStatement.returns = YES;
         NSString *resultExpr = [self expressionForRegisterResultFromState:state];
-        [out appendFormat:@"    return %@;\n}\n", resultExpr.length ? resultExpr : @"result"];
+        returnStatement.line = [NSString stringWithFormat:@"return %@;", resultExpr.length ? resultExpr : @"result"];
+        [statements addObject:returnStatement];
     }
-    return out;
+    return statements;
+}
+
+- (NSUInteger)appendStructuredStatements:(NSArray<DCLogicalStatement *> *)statements
+                                    from:(NSUInteger)start
+                                      to:(NSUInteger)end
+                                  indent:(NSUInteger)indent
+                                      out:(NSMutableString *)out
+                           addressToIndex:(NSDictionary<NSNumber *, NSNumber *> *)addressToIndex {
+    NSUInteger i = start;
+    while (i < end) {
+        NSUInteger loopEnd = [self backwardConditionalBranchIndexTargetingIndex:i
+                                                                     statements:statements
+                                                                           from:i
+                                                                             to:end
+                                                                 addressToIndex:addressToIndex];
+        if (loopEnd != NSNotFound && loopEnd > i) {
+            DCLogicalStatement *backEdge = statements[loopEnd];
+            [self appendIndent:indent to:out];
+            [out appendString:@"do {\n"];
+            [self appendStructuredStatements:statements from:i to:loopEnd indent:indent + 1 out:out addressToIndex:addressToIndex];
+            [self appendIndent:indent to:out];
+            [out appendFormat:@"} while (%@);\n", backEdge.condition ?: @"condition"];
+            i = loopEnd + 1;
+            continue;
+        }
+
+        DCLogicalStatement *statement = statements[i];
+
+        if (statement.conditionalBranch) {
+            NSNumber *targetNumber = addressToIndex[@(statement.targetAddress)];
+            NSUInteger targetIndex = targetNumber ? targetNumber.unsignedIntegerValue : NSNotFound;
+            if (targetIndex != NSNotFound && targetIndex > i && targetIndex <= end) {
+                NSUInteger thenEnd = targetIndex;
+                DCLogicalStatement *beforeTarget = targetIndex > i + 1 ? statements[targetIndex - 1] : nil;
+                NSNumber *afterElseNumber = beforeTarget.unconditionalBranch ? addressToIndex[@(beforeTarget.targetAddress)] : nil;
+                NSUInteger afterElseIndex = afterElseNumber ? afterElseNumber.unsignedIntegerValue : NSNotFound;
+
+                if (beforeTarget.unconditionalBranch && afterElseIndex != NSNotFound && afterElseIndex > targetIndex && afterElseIndex <= end) {
+                    thenEnd = targetIndex - 1;
+                    [self appendIndent:indent to:out];
+                    [out appendFormat:@"if (%@) {\n", [self negatedCondition:statement.condition]];
+                    [self appendStructuredStatements:statements from:i + 1 to:thenEnd indent:indent + 1 out:out addressToIndex:addressToIndex];
+                    [self appendIndent:indent to:out];
+                    [out appendString:@"} else {\n"];
+                    [self appendStructuredStatements:statements from:targetIndex to:afterElseIndex indent:indent + 1 out:out addressToIndex:addressToIndex];
+                    [self appendIndent:indent to:out];
+                    [out appendString:@"}\n"];
+                    i = afterElseIndex;
+                    continue;
+                }
+
+                [self appendIndent:indent to:out];
+                [out appendFormat:@"if (%@) {\n", [self negatedCondition:statement.condition]];
+                [self appendStructuredStatements:statements from:i + 1 to:targetIndex indent:indent + 1 out:out addressToIndex:addressToIndex];
+                [self appendIndent:indent to:out];
+                [out appendString:@"}\n"];
+                i = targetIndex;
+                continue;
+            }
+
+            if (targetIndex != NSNotFound && targetIndex < i) {
+                [self appendIndent:indent to:out];
+                [out appendFormat:@"if (%@) {\n", statement.condition];
+                [self appendIndent:indent + 1 to:out];
+                [out appendFormat:@"continue; /* loop back to %@ */\n", statement.targetLabel ?: @"earlier block"];
+                [self appendIndent:indent to:out];
+                [out appendString:@"}\n"];
+                i++;
+                continue;
+            }
+            [self appendIndent:indent to:out];
+            [out appendFormat:@"if (%@) goto %@;\n", statement.condition ?: @"condition", statement.targetLabel ?: @"unknown_target"];
+            i++;
+            continue;
+        }
+
+        if (statement.unconditionalBranch) {
+            NSNumber *targetNumber = addressToIndex[@(statement.targetAddress)];
+            NSUInteger targetIndex = targetNumber ? targetNumber.unsignedIntegerValue : NSNotFound;
+            if (targetIndex != NSNotFound && targetIndex < i) {
+                [self appendIndent:indent to:out];
+                [out appendFormat:@"while (true) { /* back edge to %@ */\n", statement.targetLabel ?: @"earlier block"];
+                [self appendIndent:indent + 1 to:out];
+                [out appendString:@"break; /* loop body is above in linearized output */\n"];
+                [self appendIndent:indent to:out];
+                [out appendString:@"}\n"];
+                i++;
+                continue;
+            }
+            if (targetIndex != NSNotFound && targetIndex == i + 1) {
+                i++;
+                continue;
+            }
+            [self appendIndent:indent to:out];
+            [out appendFormat:@"goto %@;\n", statement.targetLabel ?: @"unknown_target"];
+            i++;
+            continue;
+        }
+
+        if (statement.line.length > 0) {
+            [self appendIndent:indent to:out];
+            [out appendFormat:@"%@\n", statement.line];
+        }
+        i++;
+    }
+    return i;
+}
+
+- (NSUInteger)backwardConditionalBranchIndexTargetingIndex:(NSUInteger)targetIndex
+                                                statements:(NSArray<DCLogicalStatement *> *)statements
+                                                      from:(NSUInteger)start
+                                                        to:(NSUInteger)end
+                                            addressToIndex:(NSDictionary<NSNumber *, NSNumber *> *)addressToIndex {
+    if (targetIndex >= statements.count) return NSNotFound;
+    uint64_t targetAddress = statements[targetIndex].address;
+    for (NSUInteger i = start + 1; i < end; i++) {
+        DCLogicalStatement *candidate = statements[i];
+        if (!candidate.conditionalBranch || candidate.targetAddress != targetAddress) {
+            continue;
+        }
+        NSNumber *mapped = addressToIndex[@(candidate.targetAddress)];
+        if (mapped && mapped.unsignedIntegerValue == targetIndex) {
+            return i;
+        }
+    }
+    return NSNotFound;
+}
+
+- (NSString *)negatedCondition:(NSString *)condition {
+    NSString *c = condition ?: @"condition";
+    NSArray<NSArray<NSString *> *> *pairs = @[
+        @[@" <= 0", @" > 0"],
+        @[@" >= 0", @" < 0"],
+        @[@" == 0", @" != 0"],
+        @[@" != 0", @" == 0"],
+        @[@" < 0", @" >= 0"],
+        @[@" > 0", @" <= 0"],
+    ];
+    for (NSArray<NSString *> *pair in pairs) {
+        NSString *from = pair[0];
+        NSString *to = pair[1];
+        if ([c hasSuffix:from]) {
+            return [[c substringToIndex:c.length - from.length] stringByAppendingString:to];
+        }
+    }
+    return [NSString stringWithFormat:@"!(%@)", c];
+}
+
+- (void)appendIndent:(NSUInteger)indent to:(NSMutableString *)out {
+    for (NSUInteger i = 0; i < indent; i++) {
+        [out appendString:@"    "];
+    }
+}
+
+- (BOOL)isUnconditionalJump:(NSString *)mnemonic {
+    NSString *m = [mnemonic.lowercaseString stringByReplacingOccurrencesOfString:@"." withString:@""];
+    return [m isEqualToString:@"jmp"] || [m isEqualToString:@"b"];
+}
+
+- (uint64_t)targetAddressFromOperand:(NSString *)operand {
+    NSString *trimmed = [[operand stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
+    trimmed = [trimmed stringByReplacingOccurrencesOfString:@"#" withString:@""];
+    NSScanner *scanner = [NSScanner scannerWithString:trimmed];
+    unsigned long long value = 0;
+    if ([trimmed hasPrefix:@"0x"]) {
+        return [scanner scanHexLongLong:&value] ? value : 0;
+    }
+    return [scanner scanUnsignedLongLong:&value] ? value : 0;
 }
 
 - (NSString *)logicalLineForInstruction:(DCInstruction *)instruction
@@ -635,12 +866,19 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
     }
 
     if (([mn hasPrefix:@"ldr"] || [mn isEqualToString:@"load"]) && ops.count >= 2) {
-        NSString *expr = [self logicalMemoryExpressionForOperand:ops[1] state:state];
+        NSString *slot = [self stackSlotNameForOperand:ops[1]];
+        NSString *expr = slot ?: [self logicalMemoryExpressionForOperand:ops[1] state:state];
         return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
     }
 
     if (([mn hasPrefix:@"str"] || [mn isEqualToString:@"store"]) && ops.count >= 2) {
         NSString *value = [self logicalExpressionForOperand:ops[0] state:state];
+        NSString *slot = [self stackSlotNameForOperand:ops[1]];
+        if (slot.length > 0) {
+            NSString *prefix = [declared containsObject:slot] ? @"" : @"uint64_t ";
+            [declared addObject:slot];
+            return [NSString stringWithFormat:@"%@%@ = %@;%@", prefix, slot, value, comment];
+        }
         NSString *target = [self logicalMemoryExpressionForOperand:ops[1] state:state];
         return [NSString stringWithFormat:@"%@ = %@;%@", target, value, comment];
     }
@@ -724,6 +962,15 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
     if ([mn hasPrefix:@"cset"] && ops.count >= 1) {
         NSString *condition = ops.count >= 2 ? [NSString stringWithFormat:@"condition_%@", [self sanitizedIdentifierFromString:ops[1] prefix:@""]] : @"condition";
         return [self assignLogicalExpression:[NSString stringWithFormat:@"(%@ ? 1 : 0)", condition] toOperand:ops[0] state:state declared:declared comment:comment];
+    }
+
+    if ([mn isEqualToString:@"csel"] && ops.count >= 4) {
+        NSString *condition = [self logicalConditionForCode:ops[3] comparison:*lastComparison];
+        NSString *expr = [NSString stringWithFormat:@"(%@ ? %@ : %@)",
+                          condition,
+                          [self logicalExpressionForOperand:ops[1] state:state],
+                          [self logicalExpressionForOperand:ops[2] state:state]];
+        return [self assignLogicalExpression:expr toOperand:ops[0] state:state declared:declared comment:comment];
     }
 
     if ([mn isEqualToString:@"call"] || [mn isEqualToString:@"bl"] || [mn isEqualToString:@"blr"]) {
@@ -865,11 +1112,36 @@ static uint64_t dc_read64(const uint8_t *p, BOOL swap) {
 }
 
 - (NSString *)expressionForRegisterResultFromState:(NSDictionary<NSString *, NSString *> *)state {
-    for (NSString *reg in @[@"x0", @"w0", @"rax", @"eax", @"r0"]) {
+    for (NSString *reg in @[@"w0", @"x0", @"eax", @"rax", @"r0"]) {
         NSString *expr = state[reg];
         if (expr.length > 0) return expr;
     }
     return @"result";
+}
+
+- (NSString *)stackSlotNameForOperand:(NSString *)operand {
+    NSString *lower = operand.lowercaseString;
+    if (!([lower containsString:@"sp"] || [lower containsString:@"rsp"] || [lower containsString:@"esp"] ||
+          [lower containsString:@"fp"] || [lower containsString:@"rbp"] || [lower containsString:@"ebp"])) {
+        return nil;
+    }
+    NSRegularExpression *hexRegex = [NSRegularExpression regularExpressionWithPattern:@"0x[0-9a-f]+" options:0 error:nil];
+    NSTextCheckingResult *hex = [hexRegex firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+    NSString *offset = nil;
+    if (hex) {
+        offset = [lower substringWithRange:hex.range];
+    } else {
+        NSRegularExpression *decRegex = [NSRegularExpression regularExpressionWithPattern:@"[+-]?\\b[0-9]+\\b" options:0 error:nil];
+        NSTextCheckingResult *dec = [decRegex firstMatchInString:lower options:0 range:NSMakeRange(0, lower.length)];
+        if (dec) offset = [lower substringWithRange:dec.range];
+    }
+    if (offset.length == 0) {
+        offset = @"0";
+    }
+    offset = [offset stringByReplacingOccurrencesOfString:@"-" withString:@"neg_"];
+    offset = [offset stringByReplacingOccurrencesOfString:@"+" withString:@""];
+    offset = [offset stringByReplacingOccurrencesOfString:@"0x" withString:@""];
+    return [NSString stringWithFormat:@"local_%@", [self sanitizedIdentifierFromString:offset prefix:@""]];
 }
 
 - (NSString *)callArgumentExpressionAtIndex:(NSUInteger)index state:(NSDictionary<NSString *, NSString *> *)state {

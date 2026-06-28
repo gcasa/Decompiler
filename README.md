@@ -66,7 +66,7 @@ The metadata line shows the detected file format, architecture, entry point, and
 
 ## Pseudocode Modes
 
-`Structured C` runs a lightweight symbolic pass over the decoded instructions. It tracks register expressions, maps ABI argument registers to `arg0` through `arg3`, renders memory operands as pointer dereferences, derives comparison-based branch conditions, and emits C-like temporaries instead of wrapping assembly text.
+`Structured C` runs a lightweight symbolic pass over the decoded instructions. It tracks register expressions, maps ABI argument registers to `arg0` through `arg3`, recovers simple stack slots as `local_*` variables, renders other memory operands as pointer dereferences, derives comparison-based branch conditions, and emits C-like temporaries instead of wrapping assembly text. A formatting pass recognizes common forward branch patterns as `if`/`else` blocks and simple back-edge patterns as loops.
 
 `Compact C` emits the same symbolic C-like logic with less address commentary.
 
